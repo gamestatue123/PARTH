@@ -3,7 +3,7 @@ import { useEffect, useMemo, useState } from 'react'
 type Mode = 'student' | 'worker' | 'custom'
 type Tone = 'Calm' | 'Neutral' | 'Technical'
 type TaskState = 'Idle' | 'Queued' | 'Running' | 'Suspended' | 'Completed'
-type PresetSound = 'Neural pulse' | 'Soft bell' | 'Mechanical click' | 'Ambient tone'
+type Sound = 'Neural pulse' | 'Soft bell' | 'Mechanical click' | 'Ambient tone'
 type RuleTemplate =
   | 'missed_deadline_requeue'
   | 'early_break_reduce_next'
@@ -15,12 +15,14 @@ interface Task {
   category: string
   priorityWeight: number
   estimatedFocusCost: number
+  deadline?: string
   state: TaskState
   mode: Mode
-  deadline?: string
+  intensity: number
   createdAt: string
   completedAt?: string
   totalFocusSeconds: number
+  scheduledFor?: string
 }
 
 interface Session {
@@ -39,32 +41,31 @@ interface Settings {
   pomodoro: Record<Mode, { focus: number; break: number }>
   neuralIntensity: number
   notificationStrength: number
-  adaptivePomodoro: boolean
+  sound: Sound
   volume: number
+  adaptivePomodoro: boolean
+  focusStyle: 'Deep' | 'Balanced' | 'Sprint'
   focusMode: boolean
-  presetSound: PresetSound
-  customSoundPath: string
-  useCustomSound: boolean
 }
 
 interface State {
   tasks: Task[]
   sessions: Session[]
   settings: Settings
+  activeTaskId?: string
   timer: {
     phase: 'focus' | 'break'
-    running: boolean
     remaining: number
     total: number
+    running: boolean
   }
-  activeTaskId?: string
   streak: number
   onboardingDone: boolean
   rules: RuleTemplate[]
 }
 
-const STORAGE_KEY = 'parth.neural.v2'
-const syncChannel = new BroadcastChannel('parth-sync')
+const STORAGE_KEY = 'parth.neural.v1'
+const channel = new BroadcastChannel('parth-sync')
 
 const defaultSettings: Settings = {
   mode: 'student',
@@ -75,47 +76,51 @@ const defaultSettings: Settings = {
     custom: { focus: 35, break: 8 }
   },
   neuralIntensity: 0.7,
-  notificationStrength: 0.55,
+  notificationStrength: 0.5,
+  sound: 'Neural pulse',
+  volume: 0.5,
   adaptivePomodoro: true,
-  volume: 0.65,
-  focusMode: false,
-  presetSound: 'Neural pulse',
-  customSoundPath: '/sounds/custom/your-sound.mp3',
-  useCustomSound: false
+  focusStyle: 'Balanced',
+  focusMode: false
 }
 
 const initialState: State = {
   tasks: [],
   sessions: [],
   settings: defaultSettings,
-  timer: { phase: 'focus', running: false, remaining: 25 * 60, total: 25 * 60 },
-  activeTaskId: undefined,
+  timer: { phase: 'focus', remaining: 25 * 60, total: 25 * 60, running: false },
   streak: 0,
   onboardingDone: false,
   rules: ['missed_deadline_requeue', 'early_break_reduce_next', 'streak_extend_session']
 }
 
 const uid = () => Math.random().toString(36).slice(2, 10)
-const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value))
 
-function formatTime(totalSeconds: number) {
-  const minutes = Math.floor(totalSeconds / 60)
-  const seconds = totalSeconds % 60
-  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+const formatTime = (seconds: number) => {
+  const m = Math.floor(seconds / 60)
+  const s = seconds % 60
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
 }
 
-function normalizeState(candidate: State): State {
-  return {
-    ...candidate,
-    settings: {
-      ...defaultSettings,
-      ...candidate.settings,
-      pomodoro: {
-        ...defaultSettings.pomodoro,
-        ...(candidate.settings?.pomodoro ?? {})
-      }
-    }
+const clamp = (n: number, min: number, max: number) => Math.min(max, Math.max(min, n))
+
+const playTone = (sound: Sound, volume: number) => {
+  const ctx = new AudioContext()
+  const osc = ctx.createOscillator()
+  const gain = ctx.createGain()
+  const frequencies: Record<Sound, number> = {
+    'Neural pulse': 520,
+    'Soft bell': 640,
+    'Mechanical click': 320,
+    'Ambient tone': 460
   }
+  osc.frequency.value = frequencies[sound]
+  osc.type = sound === 'Mechanical click' ? 'square' : 'sine'
+  gain.gain.value = volume * 0.2
+  osc.connect(gain)
+  gain.connect(ctx.destination)
+  osc.start()
+  osc.stop(ctx.currentTime + 0.25)
 }
 
 function App() {
@@ -123,149 +128,69 @@ function App() {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (!raw) return initialState
     try {
-      return normalizeState(JSON.parse(raw) as State)
+      return JSON.parse(raw) as State
     } catch {
       return initialState
     }
   })
-
-  const [quickTask, setQuickTask] = useState('')
+  const [quickTitle, setQuickTitle] = useState('')
   const [advancedTask, setAdvancedTask] = useState({
     name: '',
     category: 'General',
     priorityWeight: 3,
     estimatedFocusCost: 3,
     deadline: '',
-    mode: state.settings.mode as Mode
+    mode: state.settings.mode as Mode,
+    intensity: 0.7
   })
 
-  const activeTask = state.tasks.find((task) => task.id === state.activeTaskId)
+  const activeTask = state.tasks.find((t) => t.id === state.activeTaskId)
 
-  const uiPulse =
+  const modeProfile = state.settings.pomodoro[state.settings.mode]
+  const completionRatio = state.timer.total === 0 ? 0 : 1 - state.timer.remaining / state.timer.total
+  const neuralSpeed =
     state.timer.running && state.timer.phase === 'focus'
-      ? 0.75 + state.settings.neuralIntensity * 1.5
-      : 0.25 + state.settings.neuralIntensity * 0.5
-
-  const ringProgress = state.timer.total ? 1 - state.timer.remaining / state.timer.total : 0
-
-  const analytics = useMemo(() => {
-    const completedSessions = state.sessions.filter((session) => session.completed)
-    const totalFocusSeconds = completedSessions.reduce((acc, session) => acc + session.completedSeconds, 0)
-    const byHour = Array.from({ length: 24 }, (_, hour) => {
-      const count = state.sessions.filter((session) => new Date(session.startedAt).getHours() === hour).length
-      return { hour, count }
-    })
-    const peak = byHour.reduce((best, current) => (current.count > best.count ? current : best), byHour[0])
-
-    return {
-      sessionsCompleted: completedSessions.length,
-      focusHours: (totalFocusSeconds / 3600).toFixed(1),
-      peakHour: `${String(peak.hour).padStart(2, '0')}:00`,
-      completionRate:
-        state.sessions.length === 0
-          ? 100
-          : Math.round((completedSessions.length / state.sessions.length) * 100)
-    }
-  }, [state.sessions])
+      ? 0.7 + state.settings.neuralIntensity * 1.4
+      : 0.25 + state.settings.neuralIntensity * 0.45
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state))
-    syncChannel.postMessage(state)
+    channel.postMessage(state)
   }, [state])
 
   useEffect(() => {
-    const syncHandler = (event: MessageEvent<State>) => {
+    const onMessage = (event: MessageEvent<State>) => {
       setState((prev) => {
-        const incoming = normalizeState(event.data)
-        if (JSON.stringify(prev) === JSON.stringify(incoming)) return prev
-        return incoming
+        if (JSON.stringify(prev) === JSON.stringify(event.data)) return prev
+        return event.data
       })
     }
-
-    syncChannel.addEventListener('message', syncHandler)
-    return () => syncChannel.removeEventListener('message', syncHandler)
+    channel.addEventListener('message', onMessage)
+    return () => channel.removeEventListener('message', onMessage)
   }, [])
 
-  const previewAudio = () => {
-    if (state.settings.useCustomSound) {
-      const audio = new Audio(state.settings.customSoundPath)
-      audio.volume = state.settings.volume
-      void audio.play()
-      return
-    }
-
-    const context = new AudioContext()
-    const oscillator = context.createOscillator()
-    const gain = context.createGain()
-
-    const frequencies: Record<PresetSound, number> = {
-      'Neural pulse': 520,
-      'Soft bell': 660,
-      'Mechanical click': 310,
-      'Ambient tone': 430
-    }
-
-    oscillator.frequency.value = frequencies[state.settings.presetSound]
-    oscillator.type = state.settings.presetSound === 'Mechanical click' ? 'square' : 'sine'
-    gain.gain.value = state.settings.volume * 0.22
-    oscillator.connect(gain)
-    gain.connect(context.destination)
-    oscillator.start()
-    oscillator.stop(context.currentTime + 0.23)
-  }
-
-  const getAdaptiveFocusSeconds = () => {
-    const modeProfile = state.settings.pomodoro[state.settings.mode]
-    if (!state.settings.adaptivePomodoro) return modeProfile.focus * 60
-
-    const recentSessions = state.sessions.slice(-6)
-    const completionRate =
-      recentSessions.length === 0
-        ? 1
-        : recentSessions.filter((session) => session.completed).length / recentSessions.length
-
-    const averageTaskCost =
-      state.tasks.length === 0
-        ? 3
-        : state.tasks.reduce((acc, task) => acc + task.estimatedFocusCost, 0) / state.tasks.length
-
-    let adaptiveMinutes = modeProfile.focus
-
-    if (completionRate < 0.5 && state.rules.includes('early_break_reduce_next')) adaptiveMinutes -= 5
-    if (completionRate > 0.8 && state.rules.includes('streak_extend_session')) adaptiveMinutes += 5
-    if (averageTaskCost >= 4) adaptiveMinutes += 5
-
-    const hour = new Date().getHours()
-    if (hour >= 22 || hour < 7) adaptiveMinutes -= 5
-
-    return clamp(adaptiveMinutes, 15, 70) * 60
-  }
-
   useEffect(() => {
-    const interval = setInterval(() => {
+    const timer = setInterval(() => {
       setState((prev) => {
         if (!prev.timer.running) return prev
-
         if (prev.timer.remaining > 0) {
-          return {
-            ...prev,
-            timer: { ...prev.timer, remaining: prev.timer.remaining - 1 }
-          }
+          return { ...prev, timer: { ...prev.timer, remaining: prev.timer.remaining - 1 } }
         }
 
         if (prev.timer.phase === 'focus') {
-          const now = new Date().toISOString()
           const finishedSession: Session | undefined = prev.activeTaskId
             ? {
                 taskId: prev.activeTaskId,
                 startedAt: new Date(Date.now() - prev.timer.total * 1000).toISOString(),
-                endedAt: now,
+                endedAt: new Date().toISOString(),
                 plannedSeconds: prev.timer.total,
                 completedSeconds: prev.timer.total,
                 completed: true,
                 interrupted: false
               }
             : undefined
+
+          if (finishedSession) playTone(prev.settings.sound, prev.settings.volume)
 
           return {
             ...prev,
@@ -275,19 +200,19 @@ function App() {
               task.id === prev.activeTaskId
                 ? {
                     ...task,
-                    state: 'Completed',
                     totalFocusSeconds: task.totalFocusSeconds + prev.timer.total,
-                    completedAt: now
+                    state: 'Completed',
+                    completedAt: new Date().toISOString()
                   }
                 : task
             ),
-            activeTaskId: undefined,
             timer: {
               phase: 'break',
               running: true,
               remaining: prev.settings.pomodoro[prev.settings.mode].break * 60,
               total: prev.settings.pomodoro[prev.settings.mode].break * 60
-            }
+            },
+            activeTaskId: undefined
           }
         }
 
@@ -303,86 +228,50 @@ function App() {
       })
     }, 1000)
 
-    return () => clearInterval(interval)
+    return () => clearInterval(timer)
   }, [])
 
-  useEffect(() => {
-    if (state.timer.phase === 'break' && state.timer.remaining === state.timer.total && state.timer.running) {
-      previewAudio()
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.timer.phase, state.timer.remaining, state.timer.total, state.timer.running])
+  const analytics = useMemo(() => {
+    const completed = state.sessions.filter((s) => s.completed).length
+    const focusHours = (state.sessions.reduce((acc, s) => acc + s.completedSeconds, 0) / 3600).toFixed(1)
+    const byHour = Array.from({ length: 24 }, (_, hour) => {
+      const count = state.sessions.filter((s) => new Date(s.startedAt).getHours() === hour).length
+      return { hour, count }
+    })
+    const peakHour = byHour.reduce((a, b) => (b.count > a.count ? b : a), byHour[0])
 
-  const applyMissedDeadlineRule = () => {
-    if (!state.rules.includes('missed_deadline_requeue')) return
-    const now = Date.now()
+    return { completed, focusHours, peakHour: `${peakHour.hour}:00` }
+  }, [state.sessions])
 
+  const getAdaptiveFocus = () => {
+    if (!state.settings.adaptivePomodoro) return modeProfile.focus * 60
+    const recent = state.sessions.slice(-6)
+    const completionRate = recent.length
+      ? recent.filter((s) => s.completed).length / recent.length
+      : 1
+    const avgTaskCost =
+      state.tasks.length > 0
+        ? state.tasks.reduce((acc, t) => acc + t.estimatedFocusCost, 0) / state.tasks.length
+        : 3
+    let minutes = modeProfile.focus
+    if (completionRate > 0.8 && state.rules.includes('streak_extend_session')) minutes += 5
+    if (completionRate < 0.5 && state.rules.includes('early_break_reduce_next')) minutes -= 5
+    if (avgTaskCost >= 4) minutes += 5
+    const hour = new Date().getHours()
+    if (hour >= 22 || hour < 7) minutes -= 5
+    return clamp(minutes, 15, 70) * 60
+  }
+
+  const startTask = (taskId: string) => {
+    const total = getAdaptiveFocus()
     setState((prev) => ({
       ...prev,
-      tasks: prev.tasks.map((task) => {
-        if (task.deadline && new Date(task.deadline).getTime() < now && task.state !== 'Completed') {
-          return { ...task, state: 'Queued' }
-        }
-        return task
-      })
-    }))
-  }
-
-  useEffect(() => {
-    const tick = setInterval(applyMissedDeadlineRule, 30_000)
-    return () => clearInterval(tick)
-  })
-
-  const createQuickTask = () => {
-    if (!quickTask.trim()) return
-
-    const task: Task = {
-      id: uid(),
-      name: quickTask.trim(),
-      category: 'General',
-      priorityWeight: 3,
-      estimatedFocusCost: 3,
-      state: 'Queued',
-      mode: state.settings.mode,
-      createdAt: new Date().toISOString(),
-      totalFocusSeconds: 0
-    }
-
-    setState((prev) => ({ ...prev, tasks: [...prev.tasks, task] }))
-    setQuickTask('')
-  }
-
-  const createAdvancedTask = () => {
-    if (!advancedTask.name.trim()) return
-
-    const task: Task = {
-      id: uid(),
-      name: advancedTask.name.trim(),
-      category: advancedTask.category,
-      priorityWeight: advancedTask.priorityWeight,
-      estimatedFocusCost: advancedTask.estimatedFocusCost,
-      state: 'Queued',
-      mode: advancedTask.mode,
-      deadline: advancedTask.deadline || undefined,
-      createdAt: new Date().toISOString(),
-      totalFocusSeconds: 0
-    }
-
-    setState((prev) => ({ ...prev, tasks: [...prev.tasks, task] }))
-    setAdvancedTask((prev) => ({ ...prev, name: '', deadline: '' }))
-  }
-
-  const runTask = (taskId: string) => {
-    const total = getAdaptiveFocusSeconds()
-
-    setState((prev) => ({
-      ...prev,
-      activeTaskId: taskId,
-      tasks: prev.tasks.map((task) => {
-        if (task.id === prev.activeTaskId && task.state === 'Running') return { ...task, state: 'Suspended' }
-        if (task.id === taskId) return { ...task, state: 'Running' }
-        return task
+      tasks: prev.tasks.map((t) => {
+        if (t.id === prev.activeTaskId && t.state === 'Running') return { ...t, state: 'Suspended' }
+        if (t.id === taskId) return { ...t, state: 'Running' }
+        return t
       }),
+      activeTaskId: taskId,
       timer: { phase: 'focus', running: true, remaining: total, total }
     }))
   }
@@ -391,13 +280,69 @@ function App() {
     setState((prev) => ({
       ...prev,
       timer: { ...prev.timer, running: !prev.timer.running },
-      tasks: prev.tasks.map((task) =>
-        task.id === prev.activeTaskId
-          ? { ...task, state: prev.timer.running ? 'Suspended' : 'Running' }
-          : task
+      tasks: prev.tasks.map((t) =>
+        t.id === prev.activeTaskId
+          ? { ...t, state: prev.timer.running ? 'Suspended' : 'Running' }
+          : t
       )
     }))
   }
+
+  const addQuickTask = () => {
+    if (!quickTitle.trim()) return
+    const task: Task = {
+      id: uid(),
+      name: quickTitle.trim(),
+      category: 'General',
+      priorityWeight: 3,
+      estimatedFocusCost: 3,
+      state: 'Queued',
+      mode: state.settings.mode,
+      intensity: state.settings.neuralIntensity,
+      createdAt: new Date().toISOString(),
+      totalFocusSeconds: 0
+    }
+    setState((prev) => ({ ...prev, tasks: [...prev.tasks, task] }))
+    setQuickTitle('')
+  }
+
+  const addAdvancedTask = () => {
+    if (!advancedTask.name.trim()) return
+    const task: Task = {
+      id: uid(),
+      name: advancedTask.name.trim(),
+      category: advancedTask.category,
+      priorityWeight: advancedTask.priorityWeight,
+      estimatedFocusCost: advancedTask.estimatedFocusCost,
+      deadline: advancedTask.deadline || undefined,
+      state: 'Queued',
+      mode: advancedTask.mode,
+      intensity: advancedTask.intensity,
+      createdAt: new Date().toISOString(),
+      totalFocusSeconds: 0
+    }
+    setState((prev) => ({ ...prev, tasks: [...prev.tasks, task] }))
+    setAdvancedTask((s) => ({ ...s, name: '', deadline: '' }))
+  }
+
+  const applyDeadlineRules = () => {
+    if (!state.rules.includes('missed_deadline_requeue')) return
+    const now = Date.now()
+    setState((prev) => ({
+      ...prev,
+      tasks: prev.tasks.map((t) => {
+        if (t.deadline && new Date(t.deadline).getTime() < now && t.state !== 'Completed') {
+          return { ...t, state: 'Queued' }
+        }
+        return t
+      })
+    }))
+  }
+
+  useEffect(() => {
+    const timer = setInterval(applyDeadlineRules, 30_000)
+    return () => clearInterval(timer)
+  })
 
   const sortedTasks = [...state.tasks].sort((a, b) => {
     if (a.state === 'Running') return -1
@@ -409,304 +354,107 @@ function App() {
 
   return (
     <div className={`app mode-${state.settings.mode} ${state.settings.focusMode ? 'focus-mode' : ''}`}>
-      <div className="neural-grid" style={{ ['--velocity' as string]: uiPulse, ['--intensity' as string]: state.settings.neuralIntensity }} />
-
+      <div className="neural-layer" style={{ ['--speed' as string]: neuralSpeed, ['--intensity' as string]: state.settings.neuralIntensity }} />
       {!state.onboardingDone && (
-        <section className="onboarding glass">
-          <h1>PARTH · Neural Runtime</h1>
-          <p>Configure your mental operating mode and start immediate execution.</p>
-          <div className="row wrap">
-            <select value={state.settings.mode} onChange={(event) => setState((prev) => ({ ...prev, settings: { ...prev.settings, mode: event.target.value as Mode } }))}>
+        <section className="onboarding panel">
+          <h1>PARTH — Neural Focus OS</h1>
+          <p>Pick your mode, choose your sound, create your first task, then execute.</p>
+          <div className="row">
+            <select value={state.settings.mode} onChange={(e) => setState((prev) => ({ ...prev, settings: { ...prev.settings, mode: e.target.value as Mode } }))}>
               <option value="student">Student Mode</option>
               <option value="worker">Worker Mode</option>
               <option value="custom">Custom Mode</option>
             </select>
-            <select value={state.settings.tone} onChange={(event) => setState((prev) => ({ ...prev, settings: { ...prev.settings, tone: event.target.value as Tone } }))}>
-              <option>Calm</option>
-              <option>Neutral</option>
-              <option>Technical</option>
+            <select value={state.settings.sound} onChange={(e) => setState((prev) => ({ ...prev, settings: { ...prev.settings, sound: e.target.value as Sound } }))}>
+              <option>Neural pulse</option><option>Soft bell</option><option>Mechanical click</option><option>Ambient tone</option>
             </select>
-            <button onClick={previewAudio}>Preview Sound</button>
-            <button className="primary" onClick={() => setState((prev) => ({ ...prev, onboardingDone: true }))}>Initialize PARTH</button>
+            <button onClick={() => playTone(state.settings.sound, state.settings.volume)}>Preview sound</button>
+            <button className="primary" onClick={() => setState((prev) => ({ ...prev, onboardingDone: true }))}>Start PARTH</button>
           </div>
         </section>
       )}
 
-      <header className="hero glass">
+      <header className="panel topbar">
         <div>
-          <span className="status-pill">{state.timer.running ? 'Focused Execution' : 'Ready State'}</span>
-          <h2>{activeTask?.name ?? 'Select one task and enter cognitive flow'}</h2>
-          <p>
-            {activeTask ? `${activeTask.state} · ${activeTask.category}` : 'No active process'} · {state.settings.mode.toUpperCase()} MODE · {state.settings.tone} Language Tone
-          </p>
+          <h2>{activeTask?.name ?? 'Ready for next execution'}</h2>
+          <p>{activeTask ? activeTask.state : 'Queued / Idle'} · {state.settings.tone} tone · Sync enabled</p>
         </div>
-
-        <div className="ring-wrap">
-          <div className="ring" style={{ ['--progress' as string]: ringProgress }}>
+        <div className="timer-loop">
+          <div className="ring" style={{ ['--progress' as string]: completionRatio }}>
             <strong>{formatTime(state.timer.remaining)}</strong>
             <small>{state.timer.phase.toUpperCase()}</small>
           </div>
-          <button className="primary" onClick={activeTask ? pauseOrResume : () => sortedTasks[0] && runTask(sortedTasks[0].id)}>
-            {activeTask ? (state.timer.running ? 'Pause' : 'Resume') : 'Start Session'}
+          <button className="primary" onClick={activeTask ? pauseOrResume : () => sortedTasks[0] && startTask(sortedTasks[0].id)}>
+            {activeTask ? (state.timer.running ? 'Pause' : 'Resume') : 'Start'}
           </button>
         </div>
       </header>
 
-      <main className="layout">
-        <section className="glass task-runtime">
+      <main className="grid">
+        <section className="panel">
           <h3>Task Runtime</h3>
           <div className="row">
-            <input
-              placeholder="Quick add task"
-              value={quickTask}
-              onChange={(event) => setQuickTask(event.target.value)}
-            />
-            <button onClick={createQuickTask}>Add</button>
+            <input placeholder="Quick add task" value={quickTitle} onChange={(e) => setQuickTitle(e.target.value)} />
+            <button onClick={addQuickTask}>Add</button>
           </div>
-
-          <div className="advanced-grid">
-            <input
-              placeholder="Task name"
-              value={advancedTask.name}
-              onChange={(event) => setAdvancedTask((prev) => ({ ...prev, name: event.target.value }))}
-            />
-            <input
-              placeholder="Category"
-              value={advancedTask.category}
-              onChange={(event) => setAdvancedTask((prev) => ({ ...prev, category: event.target.value }))}
-            />
-            <label>
-              Priority {advancedTask.priorityWeight}
-              <input
-                type="range"
-                min={1}
-                max={5}
-                value={advancedTask.priorityWeight}
-                onChange={(event) => setAdvancedTask((prev) => ({ ...prev, priorityWeight: Number(event.target.value) }))}
-              />
-            </label>
-            <label>
-              Focus Cost {advancedTask.estimatedFocusCost}
-              <input
-                type="range"
-                min={1}
-                max={5}
-                value={advancedTask.estimatedFocusCost}
-                onChange={(event) => setAdvancedTask((prev) => ({ ...prev, estimatedFocusCost: Number(event.target.value) }))}
-              />
-            </label>
-            <input
-              type="datetime-local"
-              value={advancedTask.deadline}
-              onChange={(event) => setAdvancedTask((prev) => ({ ...prev, deadline: event.target.value }))}
-            />
-            <select
-              value={advancedTask.mode}
-              onChange={(event) => setAdvancedTask((prev) => ({ ...prev, mode: event.target.value as Mode }))}
-            >
-              <option value="student">Student</option>
-              <option value="worker">Worker</option>
-              <option value="custom">Custom</option>
+          <div className="advanced">
+            <input placeholder="Task name" value={advancedTask.name} onChange={(e) => setAdvancedTask((s) => ({ ...s, name: e.target.value }))} />
+            <input placeholder="Category" value={advancedTask.category} onChange={(e) => setAdvancedTask((s) => ({ ...s, category: e.target.value }))} />
+            <label>Priority {advancedTask.priorityWeight}<input type="range" min={1} max={5} value={advancedTask.priorityWeight} onChange={(e) => setAdvancedTask((s) => ({ ...s, priorityWeight: Number(e.target.value) }))} /></label>
+            <label>Focus cost {advancedTask.estimatedFocusCost}<input type="range" min={1} max={5} value={advancedTask.estimatedFocusCost} onChange={(e) => setAdvancedTask((s) => ({ ...s, estimatedFocusCost: Number(e.target.value) }))} /></label>
+            <input type="datetime-local" value={advancedTask.deadline} onChange={(e) => setAdvancedTask((s) => ({ ...s, deadline: e.target.value }))} />
+            <select value={advancedTask.mode} onChange={(e) => setAdvancedTask((s) => ({ ...s, mode: e.target.value as Mode }))}>
+              <option value="student">Student</option><option value="worker">Worker</option><option value="custom">Custom</option>
             </select>
-            <button onClick={createAdvancedTask}>Create Advanced Task</button>
+            <button onClick={addAdvancedTask}>Create advanced task</button>
           </div>
-
-          <ul className="task-list">
+          <ul className="tasks">
             {sortedTasks.map((task) => (
-              <li key={task.id} className={task.id === state.activeTaskId ? 'active' : ''}>
+              <li key={task.id}>
                 <div>
                   <strong>{task.name}</strong>
-                  <small>
-                    {task.category} · P{task.priorityWeight} · Cost {task.estimatedFocusCost} · {task.state}
-                  </small>
+                  <small>{task.category} · P{task.priorityWeight} · Cost {task.estimatedFocusCost} · {task.state}</small>
                 </div>
-                {task.state !== 'Completed' && <button onClick={() => runTask(task.id)}>Run</button>}
+                <div className="row">
+                  {task.state !== 'Completed' && <button onClick={() => startTask(task.id)}>{task.state === 'Running' ? 'Running' : 'Run'}</button>}
+                </div>
               </li>
             ))}
           </ul>
         </section>
 
-        <section className="glass control-center">
-          <h3>Modes + Signals</h3>
-
-          <label>
-            Mode
-            <select value={state.settings.mode} onChange={(event) => setState((prev) => ({ ...prev, settings: { ...prev.settings, mode: event.target.value as Mode } }))}>
-              <option value="student">Student</option>
-              <option value="worker">Worker</option>
-              <option value="custom">Custom</option>
-            </select>
-          </label>
-
-          <label>
-            Language Tone
-            <select value={state.settings.tone} onChange={(event) => setState((prev) => ({ ...prev, settings: { ...prev.settings, tone: event.target.value as Tone } }))}>
-              <option>Calm</option>
-              <option>Neutral</option>
-              <option>Technical</option>
-            </select>
-          </label>
-
-          <label>
-            Focus Minutes
-            <input
-              type="number"
-              min={10}
-              max={90}
-              value={state.settings.pomodoro[state.settings.mode].focus}
-              onChange={(event) => setState((prev) => ({
-                ...prev,
-                settings: {
-                  ...prev.settings,
-                  pomodoro: {
-                    ...prev.settings.pomodoro,
-                    [prev.settings.mode]: {
-                      ...prev.settings.pomodoro[prev.settings.mode],
-                      focus: Number(event.target.value)
-                    }
-                  }
-                }
-              }))}
-            />
-          </label>
-
-          <label>
-            Break Minutes
-            <input
-              type="number"
-              min={3}
-              max={30}
-              value={state.settings.pomodoro[state.settings.mode].break}
-              onChange={(event) => setState((prev) => ({
-                ...prev,
-                settings: {
-                  ...prev.settings,
-                  pomodoro: {
-                    ...prev.settings.pomodoro,
-                    [prev.settings.mode]: {
-                      ...prev.settings.pomodoro[prev.settings.mode],
-                      break: Number(event.target.value)
-                    }
-                  }
-                }
-              }))}
-            />
-          </label>
-
-          <label>
-            Neural Intensity
-            <input
-              type="range"
-              min={0.1}
-              max={1}
-              step={0.05}
-              value={state.settings.neuralIntensity}
-              onChange={(event) => setState((prev) => ({ ...prev, settings: { ...prev.settings, neuralIntensity: Number(event.target.value) } }))}
-            />
-          </label>
-
-          <label>
-            Notification Strength
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.05}
-              value={state.settings.notificationStrength}
-              onChange={(event) => setState((prev) => ({ ...prev, settings: { ...prev.settings, notificationStrength: Number(event.target.value) } }))}
-            />
-          </label>
-
-          <label>
-            Preset Sound
-            <select value={state.settings.presetSound} onChange={(event) => setState((prev) => ({ ...prev, settings: { ...prev.settings, presetSound: event.target.value as PresetSound } }))}>
-              <option>Neural pulse</option>
-              <option>Soft bell</option>
-              <option>Mechanical click</option>
-              <option>Ambient tone</option>
-            </select>
-          </label>
-
-          <label>
-            Custom Sound Path (from /public)
-            <input
-              placeholder="/sounds/custom/your-sound.mp3"
-              value={state.settings.customSoundPath}
-              onChange={(event) => setState((prev) => ({ ...prev, settings: { ...prev.settings, customSoundPath: event.target.value } }))}
-            />
-          </label>
-
-          <label>
-            Volume
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.05}
-              value={state.settings.volume}
-              onChange={(event) => setState((prev) => ({ ...prev, settings: { ...prev.settings, volume: Number(event.target.value) } }))}
-            />
-          </label>
-
-          <div className="row wrap">
-            <button onClick={() => setState((prev) => ({ ...prev, settings: { ...prev.settings, adaptivePomodoro: !prev.settings.adaptivePomodoro } }))}>
-              Adaptive {state.settings.adaptivePomodoro ? 'On' : 'Off'}
-            </button>
-            <button onClick={() => setState((prev) => ({ ...prev, settings: { ...prev.settings, useCustomSound: !prev.settings.useCustomSound } }))}>
-              {state.settings.useCustomSound ? 'Using Custom Sound' : 'Using Preset Sound'}
-            </button>
-            <button onClick={() => setState((prev) => ({ ...prev, settings: { ...prev.settings, focusMode: !prev.settings.focusMode } }))}>
-              {state.settings.focusMode ? 'Exit Focus Mode' : 'Enter Focus Mode'}
-            </button>
-            <button onClick={previewAudio}>Preview Sound</button>
+        <section className="panel">
+          <h3>Customization + Modes</h3>
+          <label>Mode<select value={state.settings.mode} onChange={(e) => setState((prev) => ({ ...prev, settings: { ...prev.settings, mode: e.target.value as Mode } }))}><option value="student">Student</option><option value="worker">Worker</option><option value="custom">Custom</option></select></label>
+          <label>Language Tone<select value={state.settings.tone} onChange={(e) => setState((prev) => ({ ...prev, settings: { ...prev.settings, tone: e.target.value as Tone } }))}><option>Calm</option><option>Neutral</option><option>Technical</option></select></label>
+          <label>Focus minutes ({state.settings.mode})<input type="number" min={10} max={90} value={state.settings.pomodoro[state.settings.mode].focus} onChange={(e) => setState((prev) => ({ ...prev, settings: { ...prev.settings, pomodoro: { ...prev.settings.pomodoro, [prev.settings.mode]: { ...prev.settings.pomodoro[prev.settings.mode], focus: Number(e.target.value) } } } }))} /></label>
+          <label>Break minutes<input type="number" min={3} max={30} value={state.settings.pomodoro[state.settings.mode].break} onChange={(e) => setState((prev) => ({ ...prev, settings: { ...prev.settings, pomodoro: { ...prev.settings.pomodoro, [prev.settings.mode]: { ...prev.settings.pomodoro[prev.settings.mode], break: Number(e.target.value) } } } }))} /></label>
+          <label>Neural intensity<input type="range" min={0.1} max={1} step={0.05} value={state.settings.neuralIntensity} onChange={(e) => setState((prev) => ({ ...prev, settings: { ...prev.settings, neuralIntensity: Number(e.target.value) } }))} /></label>
+          <label>Notification strength<input type="range" min={0} max={1} step={0.05} value={state.settings.notificationStrength} onChange={(e) => setState((prev) => ({ ...prev, settings: { ...prev.settings, notificationStrength: Number(e.target.value) } }))} /></label>
+          <label>Sound<select value={state.settings.sound} onChange={(e) => setState((prev) => ({ ...prev, settings: { ...prev.settings, sound: e.target.value as Sound } }))}><option>Neural pulse</option><option>Soft bell</option><option>Mechanical click</option><option>Ambient tone</option></select></label>
+          <label>Volume<input type="range" min={0} max={1} step={0.05} value={state.settings.volume} onChange={(e) => setState((prev) => ({ ...prev, settings: { ...prev.settings, volume: Number(e.target.value) } }))} /></label>
+          <div className="row">
+            <button onClick={() => playTone(state.settings.sound, state.settings.volume)}>Preview</button>
+            <button onClick={() => setState((prev) => ({ ...prev, settings: { ...prev.settings, adaptivePomodoro: !prev.settings.adaptivePomodoro } }))}>Adaptive {state.settings.adaptivePomodoro ? 'On' : 'Off'}</button>
+            <button onClick={() => setState((prev) => ({ ...prev, settings: { ...prev.settings, focusMode: !prev.settings.focusMode } }))}>{state.settings.focusMode ? 'Exit Focus' : 'Enter Focus'}</button>
           </div>
         </section>
 
-        <section className="glass analytics-panel">
-          <h3>Automation + Insights</h3>
-
-          <div className="rule-grid">
-            {(Object.freeze(['missed_deadline_requeue', 'early_break_reduce_next', 'streak_extend_session']) as RuleTemplate[]).map((rule) => (
-              <button
-                key={rule}
-                onClick={() => setState((prev) => ({
-                  ...prev,
-                  rules: prev.rules.includes(rule)
-                    ? prev.rules.filter((entry) => entry !== rule)
-                    : [...prev.rules, rule]
-                }))}
-              >
-                {ruleLabel(rule)} {state.rules.includes(rule) ? '✓' : ''}
+        <section className="panel">
+          <h3>Automation + Analytics</h3>
+          <p>Templates active:</p>
+          <div className="row wrap">
+            {(['missed_deadline_requeue', 'early_break_reduce_next', 'streak_extend_session'] as RuleTemplate[]).map((rule) => (
+              <button key={rule} onClick={() => setState((prev) => ({ ...prev, rules: prev.rules.includes(rule) ? prev.rules.filter((r) => r !== rule) : [...prev.rules, rule] }))}>
+                {prevLabel(rule)} {state.rules.includes(rule) ? '✓' : ''}
               </button>
             ))}
           </div>
-
-          <div className="insight-grid">
-            <article>
-              <strong>{analytics.sessionsCompleted}</strong>
-              <small>Sessions Completed</small>
-            </article>
-            <article>
-              <strong>{state.streak}</strong>
-              <small>Focus Streak</small>
-            </article>
-            <article>
-              <strong>{analytics.focusHours}</strong>
-              <small>Focus Hours</small>
-            </article>
-            <article>
-              <strong>{analytics.peakHour}</strong>
-              <small>Peak Hour</small>
-            </article>
-            <article>
-              <strong>{analytics.completionRate}%</strong>
-              <small>Completion Rate</small>
-            </article>
-          </div>
-
-          <div className="sound-folder-help">
-            <h4>Custom Sound Folder</h4>
-            <p>Drop files in <code>public/sounds/custom/</code> then set path above, e.g. <code>/sounds/custom/my-bell.mp3</code>.</p>
+          <div className="analytics">
+            <article><strong>{analytics.completed}</strong><small>Sessions completed</small></article>
+            <article><strong>{state.streak}</strong><small>Focus streak</small></article>
+            <article><strong>{analytics.focusHours}</strong><small>Focus hours</small></article>
+            <article><strong>{analytics.peakHour}</strong><small>Peak focus hour</small></article>
           </div>
         </section>
       </main>
@@ -714,10 +462,10 @@ function App() {
   )
 }
 
-function ruleLabel(rule: RuleTemplate) {
+function prevLabel(rule: RuleTemplate) {
   if (rule === 'missed_deadline_requeue') return 'Missed deadline → Re-queue'
-  if (rule === 'early_break_reduce_next') return 'Early break → Reduce next session'
-  return 'Streak maintained → Extend next session'
+  if (rule === 'early_break_reduce_next') return 'Early break → Reduce next'
+  return 'Streak maintained → Extend session'
 }
 
 export default App

@@ -1,32 +1,20 @@
 # PARTH — Programmable Abstraction for Real-Time Task Handling
 
-PARTH is a neural-inspired focus operating system with real execution flow, adaptive sessions, and premium responsive UI.
+A cross-platform neural-inspired focus and task execution system.
 
-## Highlights
+## What is implemented
 
-- Cognitive runtime model with task states (`Idle`, `Queued`, `Running`, `Suspended`, `Completed`).
-- Single active execution engine with automatic suspension on task switch.
-- Adaptive Pomodoro logic influenced by behavior, complexity, and time of day.
-- Immersive neural UI with responsive layouts (mobile/tablet/desktop) and motion tied to focus state.
-- Focus mode with minimized peripheral panels.
-- Completion audio engine with both preset sounds and custom sound file support.
-- Automation templates for deadline re-queue, early-break reduction, and streak extension.
-- Analytics for completion counts, streak, focus hours, peak hour, and completion rate.
-- Cross-tab sync using `BroadcastChannel` and persistence using `localStorage`.
-
-## Custom sounds
-
-1. Put your sound files in:
-
-```text
-public/sounds/custom/
-```
-
-2. In the app settings, enable custom sound and set path like:
-
-```text
-/sounds/custom/my-bell.mp3
-```
+- **Cognitive runtime model** with task states: Idle, Queued, Running, Suspended, Completed.
+- **Single-running-task execution engine** with automatic suspension when switching tasks.
+- **Adaptive Pomodoro engine** (student / worker / custom profiles, plus behavior-based adaptation).
+- **Neural-responsive UI** with motion speed tied to focus activity and intensity controls.
+- **Focus mode** immersive layout with reduced peripheral UI.
+- **Session completion feedback**: neural-style visual loop completion and selectable audio tones.
+- **Modes system** (Student, Worker, Custom) altering rhythm and visual tone.
+- **Advanced customization**: timings, neural intensity, notification strength, tone, sound, volume.
+- **Automation templates** for missed deadlines, early breaks, and streak-based extension.
+- **Analytics**: sessions completed, streak, focus hours, and peak hour.
+- **Cross-tab sync** using `BroadcastChannel` plus persistence in `localStorage`.
 
 ## Run
 
